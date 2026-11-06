@@ -1,0 +1,14 @@
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+.aws-sam/
+.env
+.env.*
+!.env.example
+!.**/.env.example
+.DS_Store
+*.log
+npm-debug.log*
+coverage/
+.vscode/

@@ -1,0 +1,14 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "crm-google-inbox-jayanka"
+resolve_s3 = true
+capabilities = "CAPABILITY_IAM"
+s3_prefix = "crm-google-inbox-jayanka"
+region = "us-east-1"
+confirm_changeset = true
+parameter_overrides = "GoogleClientId=\"920364942199-l1ug5p7fpdsh5lksqt8b4thhb31s013k.apps.googleusercontent.com\" GoogleCallbackUrl=\"https://dtzckxq6e9gjc.cloudfront.net/api/oauth/google/callback\" FrontendUrl=\"https://dtzckxq6e9gjc.cloudfront.net\""
+image_repositories = []
+
+[default.global.parameters]
+region = "us-east-1"

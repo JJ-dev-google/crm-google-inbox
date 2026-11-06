@@ -1,0 +1,314 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: CRM Google Inbox - React on private S3/CloudFront and serverless Gmail API
+
+Parameters:
+  GoogleClientId:
+    Type: String
+    Description: OAuth 2.0 Web Client ID from Google Cloud Console
+  GoogleClientSecret:
+    Type: String
+    NoEcho: true
+    Description: OAuth 2.0 Web Client secret from Google Cloud Console
+  GoogleCallbackUrl:
+    Type: String
+    Description: Exact API Gateway callback URL. Set after first deployment, then redeploy.
+    Default: https://replace-after-first-deploy.invalid/prod/api/oauth/google/callback
+  FrontendUrl:
+    Type: String
+    Description: CloudFront URL from the first deployment. Set after first deployment, then redeploy.
+    Default: https://replace-after-first-deploy.invalid
+  GmailPubSubTopic:
+    Type: String
+    Description: Full Google Pub/Sub topic resource name for Gmail watch.
+    Default: projects/empyrean-plexus-513711-t1/topics/gmail-inbox-events
+  PubSubPushAudience:
+    Type: String
+    Description: Exact audience value configured for authenticated Pub/Sub push subscription.
+    Default: https://dtzckxq6e9gjc.cloudfront.net/api/pubsub/gmail
+  PubSubPushServiceAccountEmail:
+    Type: String
+    Description: Google service account email used for authenticated Pub/Sub push delivery.
+    Default: crm-pubsub-push@empyrean-plexus-513711-t1.iam.gserviceaccount.com
+
+Globals:
+  Function:
+    Runtime: nodejs20.x
+    Timeout: 30
+    MemorySize: 512
+    Environment:
+      Variables:
+        TOKEN_TABLE: !Ref OAuthTokenTable
+        STATE_TABLE: !Ref OAuthStateTable
+        SESSION_TABLE: !Ref SessionTable
+        KMS_KEY_ID: !Ref TokenKey
+        GOOGLE_CLIENT_ID: !Ref GoogleClientId
+        GOOGLE_CLIENT_SECRET: !Ref GoogleClientSecret
+        CALLBACK_URL: !Ref GoogleCallbackUrl
+        FRONTEND_URL: !Ref FrontendUrl
+        GMAIL_PUBSUB_TOPIC: !Ref GmailPubSubTopic
+        PUBSUB_PUSH_AUDIENCE: !Ref PubSubPushAudience
+        PUBSUB_PUSH_SERVICE_ACCOUNT_EMAIL: !Ref PubSubPushServiceAccountEmail
+        NOTIFICATION_TABLE: !Ref GmailNotificationTable
+
+Resources:
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  CloudFrontOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${AWS::StackName}-s3-oac
+        Description: CloudFront access to private CRM frontend bucket
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  TokenKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: CRM Google OAuth refresh-token encryption key
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AccountRootAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+  TokenKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/crm-google-oauth
+      TargetKeyId: !Ref TokenKey
+
+  OAuthTokenTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref TokenKey
+
+  GmailNotificationTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: notificationId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: notificationId
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+
+  OAuthStateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: state
+          AttributeType: S
+      KeySchema:
+        - AttributeName: state
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+
+  SessionTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: sessionId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: sessionId
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+
+  CrmApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: prod
+
+  CrmFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: backend/
+      Handler: src/index.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OAuthTokenTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OAuthStateTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SessionTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref GmailNotificationTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - kms:Encrypt
+                - kms:Decrypt
+              Resource: !GetAtt TokenKey.Arn
+      Events:
+        OAuthStart:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CrmApi
+            Path: /api/oauth/google
+            Method: GET
+        OAuthCallback:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CrmApi
+            Path: /api/oauth/google/callback
+            Method: GET
+        Inbox:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CrmApi
+            Path: /api/inbox
+            Method: GET
+        Logout:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CrmApi
+            Path: /api/logout
+            Method: POST
+        SendEmail:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CrmApi
+            Path: /api/send
+            Method: POST
+        Notifications:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CrmApi
+            Path: /api/notifications
+            Method: GET
+        GmailPubSubPush:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CrmApi
+            Path: /api/pubsub/gmail
+            Method: POST
+        RenewGmailWatchDaily:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 7 * * ? *)
+            Description: Renew Gmail watches daily before their seven-day expiry.
+            Enabled: true
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: CRM Google Inbox frontend and API proxy
+        DefaultRootObject: index.html
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: PrivateS3Origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+            OriginAccessControlId: !Ref CloudFrontOriginAccessControl
+          - Id: ApiGatewayOrigin
+            DomainName: !Sub ${CrmApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}
+            OriginPath: /prod
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              HTTPSPort: 443
+              OriginSSLProtocols: [TLSv1.2]
+        DefaultCacheBehavior:
+          TargetOriginId: PrivateS3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        CacheBehaviors:
+          - PathPattern: /api/*
+            TargetOriginId: ApiGatewayOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT]
+            CachedMethods: [GET, HEAD]
+            Compress: true
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontReadOnly
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub ${FrontendBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}
+
+Outputs:
+  FrontendUrl:
+    Description: CloudFront frontend URL
+    Value: !Sub https://${CloudFrontDistribution.DomainName}
+  FrontendBucketName:
+    Description: Private S3 bucket for frontend build files
+    Value: !Ref FrontendBucket
+  CloudFrontDistributionId:
+    Description: CloudFront distribution ID for cache invalidation
+    Value: !Ref CloudFrontDistribution
+  ApiUrl:
+    Description: API Gateway direct URL (used for Google OAuth callback)
+    Value: !Sub https://${CrmApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/prod
+  GoogleCallbackUrl:
+    Description: Copy this exact value into Google OAuth Authorized redirect URI
+    Value: !Sub https://${CrmApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/prod/api/oauth/google/callback
